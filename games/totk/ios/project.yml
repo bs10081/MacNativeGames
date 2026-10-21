@@ -20,6 +20,7 @@ targets:
       - path: ../third_party/d2r_gfx/gfx/nvn
       - path: ../third_party/d2r_gfx/gfx/tex
       - path: Gen/embed.S
+      - path: Gen/Assets.xcassets   # the game's own cover becomes the iOS AppIcon (prepared by tools/build_ipa.py)
       - path: ../runtime/loader.c
         compilerFlags: "-Dmain=totk_host_main"
     info:
@@ -52,6 +53,7 @@ targets:
                 UISceneDelegateClassName: TOTKSceneDelegate
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: ${TOTK_BUNDLE_ID}
+      ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
       PRODUCT_NAME: TOTK
       CODE_SIGN_ENTITLEMENTS: Sources/TOTK.entitlements
       TARGETED_DEVICE_FAMILY: "1,2"

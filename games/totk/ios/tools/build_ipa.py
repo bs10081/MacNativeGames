@@ -95,6 +95,17 @@ def main():
     xcconfig=gen/'totk.xcconfig'
     frameworks=' '.join('-framework '+x for x in ['UIKit','Metal','MetalFX','Foundation','QuartzCore','ImageIO','CoreGraphics','CoreText','UniformTypeIdentifiers','CoreFoundation','AudioToolbox','GameController','AVFAudio','Security'])
     xcconfig.write_text(f'OTHER_LDFLAGS = $(inherited) {frameworks} Gen/deps/lib/libopus.a Gen/deps/lib/libvpx.a {flags}\n')
+    # The game's own cover (the icon its control data carries, already extracted for the macOS package) becomes the iOS AppIcon.
+    (gen/'Assets.xcassets').mkdir(exist_ok=True)
+    (gen/'Assets.xcassets/Contents.json').write_text(json.dumps({"info":{"author":"xcode","version":1}}))
+    icns=tree/'build/AppIcon.icns'
+    if icns.exists():
+        aset=gen/'Assets.xcassets/AppIcon.appiconset'; aset.mkdir(exist_ok=True)
+        try:
+            run(['sips','-s','format','png',str(icns),'--out',str(aset/'icon-1024.png')],ios,logs/'app-icon.log',env)
+            (aset/'Contents.json').write_text(json.dumps({"images":[{"filename":"icon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}))
+        except Exception:
+            shutil.rmtree(aset,ignore_errors=True)   # no icon: the app gets the default one
     run(['xcodegen','generate','--spec','project.generated.yml'],ios,logs/'xcodegen.log',env)
     derived=tree/'build/ios-derived';run(['xcodebuild','-project','TOTKIOS.xcodeproj','-scheme','TOTKIOS','-configuration','Release',
         '-destination','generic/platform=iOS','-derivedDataPath',derived,'CODE_SIGNING_ALLOWED=NO','CODE_SIGNING_REQUIRED=NO','CODE_SIGN_IDENTITY='],
