@@ -16,7 +16,7 @@
 
    Custom layout (arrange and size the buttons like a mobile game's control settings, the user's request 2026-10-23):
    a small gear handle at the top centre of the layer opens an editor - drag any button or stick's resting place to
-   move it, double-tap one to cycle its size, triple-tap one to cycle its opacity, hold one to reset it to the default,
+   move it, tap it to select it (then its slider sets size and opacity), hold one to reset it to the default,
    and the round arrow resets all. While the editor is open the layer sends no game input. The layout lives in
    Documents/touch-layout.json: each item's id maps to its position as fractions of the safe area, plus an optional size
    in points and an optional opacity. Fractions survive rotating to the other landscape direction (the notch changes
@@ -27,11 +27,9 @@ enum { kButtonCount = 16 };
 /* The two sticks' resting places and the two editor handles are not game buttons: ids clear of every Npad bit. */
 enum { kStickLeftID = 1ull << 40, kStickRightID = 1ull << 41, kEditID = 1ull << 42, kResetID = 1ull << 43 };
 static const CGFloat kButtonSize = 46;
-static const CGFloat kSizes[] = {36, 46, 58, 72};   // double-tap cycles an item's size through these
 static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger lifts, with a controller connected
-static const NSTimeInterval kDoubleTap = .4, kHoldReset = .6;
+static const NSTimeInterval kHoldReset = .6;
 static const CGFloat kInkAlpha = .32;   // a button's opacity unless the player set one
-static const CGFloat kAlphas[] = {.15, .32, .5, .7, .9, 1};   // triple-tap cycles an item's opacity through these
 
 @implementation TOTKTouchPad {
     NSMapTable<UITouch *, NSValue *> *points;
@@ -43,8 +41,8 @@ static const CGFloat kAlphas[] = {.15, .32, .5, .7, .9, 1};   // triple-tap cycl
     BOOL editMode;
     NSMapTable<UITouch *, NSString *> *drags;         // the finger moving this item
     NSMapTable<UITouch *, NSValue *> *dragOrigins;    // where that finger went down; moving cancels the hold-reset
-    NSString *lastTapID; NSTimeInterval lastTapAt;    // taps on one item: two cycle the size, three its opacity
-    int tapCount;
+    NSString *selected;                               // the item the editor's sliders set (a tap picks it)
+    NSMapTable<UITouch *, NSNumber *> *sliderTouches; // a finger on a slider: the slider's tag (size or opacity)
     NSTimer *holdTimer;                               // holding an item without moving resets it
 }
 
@@ -56,6 +54,7 @@ static const CGFloat kAlphas[] = {.15, .32, .5, .7, .9, 1};   // triple-tap cycl
         rightOrigins = [NSMapTable strongToStrongObjectsMapTable];
         drags = [NSMapTable strongToStrongObjectsMapTable];
         dragOrigins = [NSMapTable strongToStrongObjectsMapTable];
+        sliderTouches = [NSMapTable strongToStrongObjectsMapTable];
         layout = [self readLayout];
         NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
         [center addObserver:self selector:@selector(controllersChanged:) name:GCControllerDidConnectNotification object:nil];
@@ -130,21 +129,7 @@ static const CGFloat kAlphas[] = {.15, .32, .5, .7, .9, 1};   // triple-tap cycl
     if (!d[@"x"]) { CGPoint at = [self itemCenter:item]; d[@"x"] = @((at.x - self.area.origin.x) / self.area.size.width); d[@"y"] = @((at.y - self.area.origin.y) / self.area.size.height); }
     return d;
 }
-- (void)cycleSize:(NSString *)item {   // double-tap: the next size up, wrapping at the top
-    CGFloat now = [layout[item][@"s"] doubleValue];
-    if (!now) { uint64_t id = item.longLongValue; now = id == kStickLeftID || id == kStickRightID ? self.stickRadius : kButtonSize; }
-    CGFloat next = kSizes[0];
-    for (int i = 0; i < sizeof kSizes / sizeof *kSizes; i++) if (kSizes[i] > now + 2) { next = kSizes[i]; break; }
-    [self seededItem:item][@"s"] = @(MIN(MAX(next, 24.), 110.));
-    [self saveLayout];
-}
 - (CGFloat)alphaFor:(NSString *)item { CGFloat a = [layout[item][@"a"] doubleValue]; return a ? a : kInkAlpha; }
-- (void)cycleAlpha:(NSString *)item {   // triple-tap: the next opacity step up, wrapping at the top
-    CGFloat now = [self alphaFor:item], next = kAlphas[0];
-    for (int i = 0; i < sizeof kAlphas / sizeof *kAlphas; i++) if (kAlphas[i] > now + .02) { next = kAlphas[i]; break; }
-    [self seededItem:item][@"a"] = @(next);
-    [self saveLayout];
-}
 
 - (CGRect)area { return UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets); }
 - (CGFloat)stickRadius { return MIN(70, self.area.size.height * .16); }
@@ -232,6 +217,39 @@ static const CGFloat kAlphas[] = {.15, .32, .5, .7, .9, 1};   // triple-tap cycl
     return nil;
 }
 
+/* The editor's two sliders for the selected item, along the bottom of the layer above the hint: size on the upper
+   row, opacity on the lower. Each is a track from kSliderMinX to kSliderMaxX, with a knob at the current value. */
+static const CGFloat kSliderRowGap = 34;
+- (CGRect)sliderTrack:(int)row {   // row 0 = size, row 1 = opacity
+    CGRect a = self.area;
+    CGFloat y = CGRectGetMaxY(a) - 60 - kSliderRowGap * row;
+    return CGRectMake(a.origin.x + a.size.width * .2, y, a.size.width * .6, 0);
+}
+- (CGFloat)sliderValue:(int)row {   // the selected item's size (row 0) or opacity (row 1), as 0..1 along the track
+    if (!selected) return 0;
+    if (row == 0) {
+        CGFloat s = [self seededItem:selected][@"s"] ? [layout[selected][@"s"] doubleValue] : (selected.longLongValue == kStickLeftID || selected.longLongValue == kStickRightID ? self.stickRadius : kButtonSize);
+        return (s - 24) / (110 - 24);
+    }
+    return ([self alphaFor:selected] - .1) / (1 - .1);
+}
+- (int)sliderAt:(CGPoint)p {   // which slider a touch is on (0 size, 1 opacity), or -1
+    if (!selected) return -1;
+    for (int row = 0; row < 2; row++) {
+        CGRect track = [self sliderTrack:row];
+        if (fabs(p.y - track.origin.y) < 24 && p.x > track.origin.x - 16 && p.x < track.origin.x + track.size.width + 16) return row;
+    }
+    return -1;
+}
+- (void)setSlider:(int)row toFraction:(CGFloat)f {   // writes the selected item's size or opacity from a 0..1 slider value
+    f = MIN(MAX(f, 0), 1);
+    if (!selected) return;
+    NSMutableDictionary *d = [self seededItem:selected];
+    if (row == 0) d[@"s"] = @(MIN(MAX(24 + f * (110 - 24), 24.), 110.));
+    else d[@"a"] = @(MIN(MAX(.1 + f * (1 - .1), .1), 1.));
+    [self saveLayout];
+}
+
 static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int32_t *y) {
     CGFloat dx = to.x - from.x, dy = from.y - to.y, dist = hypot(dx, dy);
     if (dist > radius) { dx *= radius / dist; dy *= radius / dist; }
@@ -274,16 +292,14 @@ static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int
             continue;
         }
         if (editMode) {
-            if (hypot(p.x - [self handleAt:kResetID].x, p.y - [self handleAt:kResetID].y) < 30) { [layout removeAllObjects]; [self saveLayout]; [self setNeedsDisplay]; continue; }
+            if (hypot(p.x - [self handleAt:kResetID].x, p.y - [self handleAt:kResetID].y) < 30) { [layout removeAllObjects]; [self saveLayout]; selected = nil; [self setNeedsDisplay]; continue; }
+            int slider = [self sliderAt:p];
+            if (slider >= 0) { [sliderTouches setObject:@(slider) forKey:t]; [self setSlider:slider toFraction:(p.x - [self sliderTrack:slider].origin.x) / [self sliderTrack:slider].size.width]; [self setNeedsDisplay]; continue; }
             NSString *item = [self itemAt:p];
-            if (!item) continue;   // a touch on empty space does nothing while arranging
+            if (!item) { selected = nil; [self setNeedsDisplay]; continue; }   // a touch on empty space clears the selection
             [drags setObject:item forKey:t]; [dragOrigins setObject:[NSValue valueWithCGPoint:p] forKey:t];
-            NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-            tapCount = [item isEqualToString:lastTapID] && now - lastTapAt < kDoubleTap ? tapCount + 1 : 1;
-            if (tapCount == 2) [self cycleSize:item];
-            if (tapCount == 3) { [self cycleAlpha:item]; tapCount = 0; lastTapID = nil; }
-            else { lastTapID = item; lastTapAt = now; }
-            if (tapCount == 1) [self holdResetLater:t item:item];
+            selected = item;
+            [self holdResetLater:t item:item];
             [self setNeedsDisplay];
             continue;
         }
@@ -297,6 +313,8 @@ static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int
     (void)event;
     for (UITouch *t in touches) {
         CGPoint p = [t locationInView:self];
+        NSNumber *slider = [sliderTouches objectForKey:t];
+        if (slider) { CGRect track = [self sliderTrack:slider.intValue]; [self setSlider:slider.intValue toFraction:(p.x - track.origin.x) / track.size.width]; [self setNeedsDisplay]; continue; }
         NSString *item = [drags objectForKey:t];
         if (item) {
             NSValue *origin = [dragOrigins objectForKey:t];
@@ -311,6 +329,7 @@ static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int
     BOOL moved = NO;
     for (UITouch *t in touches) {
         if ([drags objectForKey:t]) { [drags removeObjectForKey:t]; moved = YES; }
+        [sliderTouches removeObjectForKey:t];
         [dragOrigins removeObjectForKey:t];
         [points removeObjectForKey:t]; [leftOrigins removeObjectForKey:t]; [rightOrigins removeObjectForKey:t];
     }
@@ -367,7 +386,27 @@ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r) {
         if (!rad) { for (int i = 0; i < kButtonCount; i++) if (b[i].bit == item.longLongValue) rad = b[i].size * .75 + 8; }
         if (rad) CGContextStrokeEllipseInRect(c, CGRectMake(at.x - rad, at.y - rad, 2 * rad, 2 * rad));
     }
-    NSString *hint = @"drag = move · 2-tap = size · 3-tap = opacity · hold = reset";
+    // The selected item's ring, and its two sliders (size, opacity) above the hint.
+    if (selected) {
+        CGPoint at = [self itemCenter:selected];
+        CGFloat rad = selected.longLongValue == kStickLeftID || selected.longLongValue == kStickRightID ? [self radiusFor:selected] : 0;
+        if (!rad) for (int i = 0; i < kButtonCount; i++) if (b[i].bit == selected.longLongValue) rad = b[i].size * .75 + 8;
+        CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:1 alpha:.9].CGColor);
+        if (rad) CGContextStrokeEllipseInRect(c, CGRectMake(at.x - rad, at.y - rad, 2 * rad, 2 * rad));
+        NSArray<NSString *> *names = @[@"size", @"opacity"];
+        for (int row = 0; row < 2; row++) {
+            CGRect track = [self sliderTrack:row];
+            CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:1 alpha:.6].CGColor); CGContextSetLineWidth(c, 2);
+            CGContextMoveToPoint(c, track.origin.x, track.origin.y); CGContextAddLineToPoint(c, track.origin.x + track.size.width, track.origin.y); CGContextStrokePath(c);
+            CGFloat f = MIN(MAX([self sliderValue:row], 0), 1);
+            CGPoint knob = CGPointMake(track.origin.x + f * track.size.width, track.origin.y);
+            CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:1 alpha:.9].CGColor);
+            CGContextFillEllipseInRect(c, CGRectMake(knob.x - 11, knob.y - 11, 22, 22));
+            NSDictionary *lab = @{NSFontAttributeName: [UIFont systemFontOfSize:12], NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:.85]};
+            [names[row] drawAtPoint:CGPointMake(track.origin.x, track.origin.y - 22) withAttributes:lab];
+        }
+    }
+    NSString *hint = @"drag = move · tap = select · slider = size & opacity · hold = reset";
     NSDictionary *tiny = @{NSFontAttributeName: [UIFont systemFontOfSize:13], NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:.85]};
     CGSize hz = [hint sizeWithAttributes:tiny]; CGRect a = self.area;
     [hint drawAtPoint:CGPointMake(a.origin.x + (a.size.width - hz.width) / 2, a.origin.y + a.size.height - hz.height - 6) withAttributes:tiny];
