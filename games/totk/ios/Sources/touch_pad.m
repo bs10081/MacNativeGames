@@ -340,8 +340,11 @@ static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self touchesEnded:touches withEvent:event]; }
 - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsDisplay]; }
 
-static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r) {
-    int32_t x, y; stick_axes(o, p, r, &x, &y); CGContextStrokeEllipseInRect(c, CGRectMake(o.x - r, o.y - r, 2 * r, 2 * r));
+static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r, CGFloat alpha) {
+    int32_t x, y; stick_axes(o, p, r, &x, &y);
+    UIColor *ink = [UIColor colorWithWhite:1 alpha:alpha];
+    CGContextSetStrokeColorWithColor(c, ink.CGColor); CGContextSetFillColorWithColor(c, ink.CGColor);
+    CGContextStrokeEllipseInRect(c, CGRectMake(o.x - r, o.y - r, 2 * r, 2 * r));
     CGPoint k = CGPointMake(o.x + x / 32767.0 * r, o.y - y / 32767.0 * r);
     CGRect knob = CGRectMake(k.x - kButtonSize / 2, k.y - kButtonSize / 2, kButtonSize, kButtonSize);
     CGContextFillEllipseInRect(c, knob); CGContextStrokeEllipseInRect(c, knob);
@@ -356,10 +359,11 @@ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r) {
     NSString *leftKey = @(kStickLeftID).stringValue, *rightKey = @(kStickRightID).stringValue;
     CGFloat rl = [self radiusFor:leftKey], rr = [self radiusFor:rightKey];
     // Each stick is drawn where its finger went down while it is held. Its resting ring shows only in the editor, for placing it.
-    if (editMode && !leftOrigins.count) { CGPoint rest = [self restingStickID:kStickLeftID]; draw_stick(c, rest, rest, rl); }
-    if (editMode && !rightOrigins.count) { CGPoint rest = [self restingStickID:kStickRightID]; draw_stick(c, rest, rest, rr); }
-    for (UITouch *t in leftOrigins.keyEnumerator) draw_stick(c, [leftOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, rl);
-    for (UITouch *t in rightOrigins.keyEnumerator) draw_stick(c, [rightOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, rr);
+    CGFloat stickAlpha = editMode ? .85 : kInkAlpha;
+    if (editMode && !leftOrigins.count) { CGPoint rest = [self restingStickID:kStickLeftID]; draw_stick(c, rest, rest, rl, stickAlpha); }
+    if (editMode && !rightOrigins.count) { CGPoint rest = [self restingStickID:kStickRightID]; draw_stick(c, rest, rest, rr, stickAlpha); }
+    for (UITouch *t in leftOrigins.keyEnumerator) draw_stick(c, [leftOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, rl, stickAlpha);
+    for (UITouch *t in rightOrigins.keyEnumerator) draw_stick(c, [rightOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, rr, stickAlpha);
     TouchButton b[kButtonCount]; [self buttons:b];
     for (int i = 0; i < kButtonCount; i++) {
         // The editor lifts faint buttons so they stay findable; the play layer shows the player's own opacity.
