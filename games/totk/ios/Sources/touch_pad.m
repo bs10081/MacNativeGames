@@ -11,15 +11,17 @@
    A touch that misses every button is a stick, centred where the finger went down: the left stick on the left half,
    the camera (right stick) on the right half. Bits are the Npad buttons. While a game controller is connected the layer
    is hidden; a touch shows it and works as usual, and it hides again 3 seconds after the last finger lifts.
+   A stick's ring is drawn only while a finger holds it (the user's request 2026-10-23: like a mobile game, nothing
+   shows until it is touched); the rings show at their resting places only while the editor is open.
 
    Custom layout (arrange and size the buttons like a mobile game's control settings, the user's request 2026-10-23):
    a small gear handle at the top centre of the layer opens an editor - drag any button or stick's resting place to
-   move it, double-tap one to cycle its size, hold one to reset it to the default, and the round arrow resets all.
-   While the editor is open the layer sends no game input. The layout lives in Documents/touch-layout.json: each item's
-   id maps to its position as fractions of the safe area, plus an optional size in points. Fractions survive rotating
-   to the other landscape direction (the notch changes side) and map across devices; the defaults above stay the
-   fallback, and saved values are clamped when read. The two editor handles stay fixed: a layout one could hide the
-   way back into the editor. */
+   move it, double-tap one to cycle its size, triple-tap one to cycle its opacity, hold one to reset it to the default,
+   and the round arrow resets all. While the editor is open the layer sends no game input. The layout lives in
+   Documents/touch-layout.json: each item's id maps to its position as fractions of the safe area, plus an optional size
+   in points and an optional opacity. Fractions survive rotating to the other landscape direction (the notch changes
+   side) and map across devices; the defaults above stay the fallback, and saved values are clamped when read. The two
+   editor handles stay fixed: a layout one could hide the way back into the editor. */
 typedef struct { CGPoint at; uint64_t bit; NSString *label; CGFloat size; } TouchButton;
 enum { kButtonCount = 16 };
 /* The two sticks' resting places and the two editor handles are not game buttons: ids clear of every Npad bit. */
@@ -28,6 +30,8 @@ static const CGFloat kButtonSize = 46;
 static const CGFloat kSizes[] = {36, 46, 58, 72};   // double-tap cycles an item's size through these
 static const NSTimeInterval kHideAfter = 3;   // seconds after the last finger lifts, with a controller connected
 static const NSTimeInterval kDoubleTap = .4, kHoldReset = .6;
+static const CGFloat kInkAlpha = .32;   // a button's opacity unless the player set one
+static const CGFloat kAlphas[] = {.15, .32, .5, .7, .9, 1};   // triple-tap cycles an item's opacity through these
 
 @implementation TOTKTouchPad {
     NSMapTable<UITouch *, NSValue *> *points;
@@ -39,7 +43,8 @@ static const NSTimeInterval kDoubleTap = .4, kHoldReset = .6;
     BOOL editMode;
     NSMapTable<UITouch *, NSString *> *drags;         // the finger moving this item
     NSMapTable<UITouch *, NSValue *> *dragOrigins;    // where that finger went down; moving cancels the hold-reset
-    NSString *lastTapID; NSTimeInterval lastTapAt;    // double-tap cycles the size
+    NSString *lastTapID; NSTimeInterval lastTapAt;    // taps on one item: two cycle the size, three its opacity
+    int tapCount;
     NSTimer *holdTimer;                               // holding an item without moving resets it
 }
 
@@ -101,6 +106,7 @@ static const NSTimeInterval kDoubleTap = .4, kHoldReset = .6;
         if (![d isKindOfClass:NSDictionary.class] || ![d[@"x"] isKindOfClass:NSNumber.class] || ![d[@"y"] isKindOfClass:NSNumber.class]) continue;
         NSMutableDictionary *clean = [@{@"x": @(MIN(MAX([d[@"x"] doubleValue], 0.), 1.)), @"y": @(MIN(MAX([d[@"y"] doubleValue], 0.), 1.))} mutableCopy];
         if ([d[@"s"] isKindOfClass:NSNumber.class]) clean[@"s"] = @(MIN(MAX([d[@"s"] doubleValue], 24.), 110.));
+        if ([d[@"a"] isKindOfClass:NSNumber.class]) clean[@"a"] = @(MIN(MAX([d[@"a"] doubleValue], .1), 1.));
         out[item] = clean;
     }
     return out;
@@ -119,14 +125,24 @@ static const NSTimeInterval kDoubleTap = .4, kHoldReset = .6;
     d[@"y"] = @((p.y - a.origin.y) / a.size.height);
 }
 - (void)resetItem:(NSString *)item { [layout removeObjectForKey:item]; [self saveLayout]; }
+- (NSMutableDictionary *)seededItem:(NSString *)item {   // the item's saved entry, with its position written in if not yet
+    NSMutableDictionary *d = layout[item] ?: (layout[item] = [NSMutableDictionary dictionary]);
+    if (!d[@"x"]) { CGPoint at = [self itemCenter:item]; d[@"x"] = @((at.x - self.area.origin.x) / self.area.size.width); d[@"y"] = @((at.y - self.area.origin.y) / self.area.size.height); }
+    return d;
+}
 - (void)cycleSize:(NSString *)item {   // double-tap: the next size up, wrapping at the top
     CGFloat now = [layout[item][@"s"] doubleValue];
     if (!now) { uint64_t id = item.longLongValue; now = id == kStickLeftID || id == kStickRightID ? self.stickRadius : kButtonSize; }
     CGFloat next = kSizes[0];
     for (int i = 0; i < sizeof kSizes / sizeof *kSizes; i++) if (kSizes[i] > now + 2) { next = kSizes[i]; break; }
-    NSMutableDictionary *d = layout[item] ?: (layout[item] = [NSMutableDictionary dictionary]);
-    if (!d[@"x"]) { CGPoint at = [self itemCenter:item]; d[@"x"] = @((at.x - self.area.origin.x) / self.area.size.width); d[@"y"] = @((at.y - self.area.origin.y) / self.area.size.height); }
-    d[@"s"] = @(MIN(MAX(next, 24.), 110.));
+    [self seededItem:item][@"s"] = @(MIN(MAX(next, 24.), 110.));
+    [self saveLayout];
+}
+- (CGFloat)alphaFor:(NSString *)item { CGFloat a = [layout[item][@"a"] doubleValue]; return a ? a : kInkAlpha; }
+- (void)cycleAlpha:(NSString *)item {   // triple-tap: the next opacity step up, wrapping at the top
+    CGFloat now = [self alphaFor:item], next = kAlphas[0];
+    for (int i = 0; i < sizeof kAlphas / sizeof *kAlphas; i++) if (kAlphas[i] > now + .02) { next = kAlphas[i]; break; }
+    [self seededItem:item][@"a"] = @(next);
     [self saveLayout];
 }
 
@@ -154,7 +170,7 @@ static const NSTimeInterval kDoubleTap = .4, kHoldReset = .6;
 - (CGPoint)restingStickID:(uint64_t)which {
     NSDictionary *d = layout[@(which).stringValue];
     CGRect a = self.area;
-    if (d) return [self pointOf:d inArea:a];
+    if (d[@"x"]) return [self pointOf:d inArea:a];
     CGFloat inset = self.columnInset + self.stickRadius * 1.9;
     return CGPointMake(which == kStickRightID ? CGRectGetMaxX(a) - inset : CGRectGetMinX(a) + inset,
                        CGRectGetMinY(a) + a.size.height * .80);
@@ -190,7 +206,7 @@ static const NSTimeInterval kDoubleTap = .4, kHoldReset = .6;
         b[i] = all[i];
         NSDictionary *saved = layout[@(b[i].bit).stringValue];
         if (!saved) continue;
-        b[i].at = [self pointOf:saved inArea:a];
+        if (saved[@"x"]) b[i].at = [self pointOf:saved inArea:a];
         if (saved[@"s"]) b[i].size = [saved[@"s"] doubleValue];
     }
 }
@@ -263,8 +279,11 @@ static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int
             if (!item) continue;   // a touch on empty space does nothing while arranging
             [drags setObject:item forKey:t]; [dragOrigins setObject:[NSValue valueWithCGPoint:p] forKey:t];
             NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
-            if ([item isEqualToString:lastTapID] && now - lastTapAt < kDoubleTap) { [self cycleSize:item]; lastTapID = nil; }
-            else { lastTapID = item; lastTapAt = now; [self holdResetLater:t item:item]; }
+            tapCount = [item isEqualToString:lastTapID] && now - lastTapAt < kDoubleTap ? tapCount + 1 : 1;
+            if (tapCount == 2) [self cycleSize:item];
+            if (tapCount == 3) { [self cycleAlpha:item]; tapCount = 0; lastTapID = nil; }
+            else { lastTapID = item; lastTapAt = now; }
+            if (tapCount == 1) [self holdResetLater:t item:item];
             [self setNeedsDisplay];
             continue;
         }
@@ -312,23 +331,25 @@ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r) {
 - (void)drawRect:(CGRect)rect {
     if (concealed) return;
     (void)rect; CGContextRef c = UIGraphicsGetCurrentContext();
-    // Steadier ink while the editor is up: the player is placing things, not playing.
-    UIColor *ink = [UIColor colorWithWhite:1 alpha:editMode ? .85 : .32];
-    // One fill for every button and knob, set before each fill: drawing a label leaves the context's fill colour at the
-    // label's, which once made every button after A (the first drawn) brighter than A and the stick knobs.
-    CGColorRef fill = ink.CGColor; CGContextSetStrokeColorWithColor(c, ink.CGColor); CGContextSetLineWidth(c, 2);
+    // Each button is set with its own colour before its fill: drawing a label leaves the context's colour at the label's.
+    UIColor *ink = [UIColor colorWithWhite:1 alpha:editMode ? .85 : kInkAlpha];
+    CGContextSetLineWidth(c, 2);
     NSString *leftKey = @(kStickLeftID).stringValue, *rightKey = @(kStickRightID).stringValue;
     CGFloat rl = [self radiusFor:leftKey], rr = [self radiusFor:rightKey];
-    // Each stick is drawn where its finger went down, or at its resting place (the player's, or the default) while idle.
-    if (!leftOrigins.count) { CGPoint rest = [self restingStickID:kStickLeftID]; draw_stick(c, rest, rest, rl); }
-    if (!rightOrigins.count) { CGPoint rest = [self restingStickID:kStickRightID]; draw_stick(c, rest, rest, rr); }
+    // Each stick is drawn where its finger went down while it is held. Its resting ring shows only in the editor, for placing it.
+    if (editMode && !leftOrigins.count) { CGPoint rest = [self restingStickID:kStickLeftID]; draw_stick(c, rest, rest, rl); }
+    if (editMode && !rightOrigins.count) { CGPoint rest = [self restingStickID:kStickRightID]; draw_stick(c, rest, rest, rr); }
     for (UITouch *t in leftOrigins.keyEnumerator) draw_stick(c, [leftOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, rl);
     for (UITouch *t in rightOrigins.keyEnumerator) draw_stick(c, [rightOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, rr);
-    NSDictionary *attrs = @{NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold], NSForegroundColorAttributeName: ink};
     TouchButton b[kButtonCount]; [self buttons:b];
     for (int i = 0; i < kButtonCount; i++) {
+        // The editor lifts faint buttons so they stay findable; the play layer shows the player's own opacity.
+        CGFloat alpha = editMode ? MIN([self alphaFor:@(b[i].bit).stringValue] * 2.2, .9) : [self alphaFor:@(b[i].bit).stringValue];
+        UIColor *itemInk = [UIColor colorWithWhite:1 alpha:alpha];
+        NSDictionary *attrs = @{NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold], NSForegroundColorAttributeName: itemInk};
         CGFloat size = b[i].size; CGRect box = CGRectMake(b[i].at.x - size / 2, b[i].at.y - size / 2, size, size);
-        CGContextSetFillColorWithColor(c, fill); CGContextFillEllipseInRect(c, box); CGContextStrokeEllipseInRect(c, box);
+        CGContextSetFillColorWithColor(c, itemInk.CGColor); CGContextSetStrokeColorWithColor(c, itemInk.CGColor);
+        CGContextFillEllipseInRect(c, box); CGContextStrokeEllipseInRect(c, box);
         CGSize z = [b[i].label sizeWithAttributes:attrs]; [b[i].label drawAtPoint:CGPointMake(b[i].at.x - z.width / 2, b[i].at.y - z.height / 2) withAttributes:attrs];
     }
     // The gear is always on (small, out of the play area): it is the way into the editor. The rest is editor chrome.
@@ -346,7 +367,7 @@ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r) {
         if (!rad) { for (int i = 0; i < kButtonCount; i++) if (b[i].bit == item.longLongValue) rad = b[i].size * .75 + 8; }
         if (rad) CGContextStrokeEllipseInRect(c, CGRectMake(at.x - rad, at.y - rad, 2 * rad, 2 * rad));
     }
-    NSString *hint = @"drag = move · double-tap = size · hold = reset";
+    NSString *hint = @"drag = move · 2-tap = size · 3-tap = opacity · hold = reset";
     NSDictionary *tiny = @{NSFontAttributeName: [UIFont systemFontOfSize:13], NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:.85]};
     CGSize hz = [hint sizeWithAttributes:tiny]; CGRect a = self.area;
     [hint drawAtPoint:CGPointMake(a.origin.x + (a.size.width - hz.width) / 2, a.origin.y + a.size.height - hz.height - 6) withAttributes:tiny];
