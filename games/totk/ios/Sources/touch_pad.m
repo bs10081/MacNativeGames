@@ -218,19 +218,22 @@ static const CGFloat kInkAlpha = .32;   // a button's opacity unless the player 
 }
 
 /* The editor's two sliders for the selected item, along the bottom of the layer above the hint: size on the upper
-   row, opacity on the lower. Each is a track from kSliderMinX to kSliderMaxX, with a knob at the current value. */
+   row, opacity on the lower, both centred under the gear. Each is a track with a knob at the current value. */
 static const CGFloat kSliderRowGap = 34;
 - (CGRect)sliderTrack:(int)row {   // row 0 = size, row 1 = opacity
     CGRect a = self.area;
-    CGFloat y = CGRectGetMaxY(a) - 60 - kSliderRowGap * row;
+    CGFloat y = a.origin.y + a.size.height * .04 + 44 + kSliderRowGap * row;
     return CGRectMake(a.origin.x + a.size.width * .2, y, a.size.width * .6, 0);
+}
+- (CGFloat)sizeOf:(NSString *)item {   // the item's size in points: its saved size, else the default for its kind
+    CGFloat s = [layout[item][@"s"] doubleValue];
+    if (s) return s;
+    uint64_t id = item.longLongValue;
+    return id == kStickLeftID || id == kStickRightID ? self.stickRadius : kButtonSize;
 }
 - (CGFloat)sliderValue:(int)row {   // the selected item's size (row 0) or opacity (row 1), as 0..1 along the track
     if (!selected) return 0;
-    if (row == 0) {
-        CGFloat s = [self seededItem:selected][@"s"] ? [layout[selected][@"s"] doubleValue] : (selected.longLongValue == kStickLeftID || selected.longLongValue == kStickRightID ? self.stickRadius : kButtonSize);
-        return (s - 24) / (110 - 24);
-    }
+    if (row == 0) return ([self sizeOf:selected] - 24) / (110 - 24);
     return ([self alphaFor:selected] - .1) / (1 - .1);
 }
 - (int)sliderAt:(CGPoint)p {   // which slider a touch is on (0 size, 1 opacity), or -1
@@ -366,8 +369,8 @@ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r, CGFloat 
     for (UITouch *t in rightOrigins.keyEnumerator) draw_stick(c, [rightOrigins objectForKey:t].CGPointValue, [points objectForKey:t].CGPointValue, rr, stickAlpha);
     TouchButton b[kButtonCount]; [self buttons:b];
     for (int i = 0; i < kButtonCount; i++) {
-        // The editor lifts faint buttons so they stay findable; the play layer shows the player's own opacity.
-        CGFloat alpha = editMode ? MIN([self alphaFor:@(b[i].bit).stringValue] * 2.2, .9) : [self alphaFor:@(b[i].bit).stringValue];
+        // The play layer and the editor show the same opacity, so the slider matches what the player sees.
+        CGFloat alpha = [self alphaFor:@(b[i].bit).stringValue];
         UIColor *itemInk = [UIColor colorWithWhite:1 alpha:alpha];
         NSDictionary *attrs = @{NSFontAttributeName: [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold], NSForegroundColorAttributeName: itemInk};
         CGFloat size = b[i].size; CGRect box = CGRectMake(b[i].at.x - size / 2, b[i].at.y - size / 2, size, size);
@@ -407,7 +410,10 @@ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r, CGFloat 
             CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:1 alpha:.9].CGColor);
             CGContextFillEllipseInRect(c, CGRectMake(knob.x - 11, knob.y - 11, 22, 22));
             NSDictionary *lab = @{NSFontAttributeName: [UIFont systemFontOfSize:12], NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:.85]};
-            [names[row] drawAtPoint:CGPointMake(track.origin.x, track.origin.y - 22) withAttributes:lab];
+            NSString *value = row == 0 ? [NSString stringWithFormat:@"size %.0f pt", [self sizeOf:selected]]
+                                       : [NSString stringWithFormat:@"opacity %.0f%%", [self alphaFor:selected] * 100];
+            NSString *label = [NSString stringWithFormat:@"%@ · %@", names[row], value];
+            [label drawAtPoint:CGPointMake(track.origin.x, track.origin.y - 22) withAttributes:lab];
         }
     }
     NSString *hint = @"drag = move · tap = select · slider = size & opacity · hold = reset";
