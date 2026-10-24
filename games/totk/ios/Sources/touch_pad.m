@@ -1,4 +1,5 @@
 #import "touch_pad.h"
+#import "device_motion.h"
 #import <GameController/GameController.h>
 #include <math.h>
 #include "runtime.h"
@@ -18,7 +19,10 @@
    a small gear handle at the top centre of the layer opens an editor - drag any button or stick's resting place to
    move it, tap it to select it (then its slider sets size and opacity), hold one to reset it to the default,
    and the round arrow resets all. While the editor is open the layer sends no game input. The layout lives in
-   Documents/touch-layout.json: each item's id maps to its position as fractions of the safe area, plus an optional size
+   Documents/save/touch-layout.json, next to the game's own saves (Documents/save is the profile folder main.m sets as
+   TOTK_PROFILE_DIR, and <profile>/save/<uid> holds the saves): backing up or moving the saves carries the button layout
+   with them (the user's request 2026-10-24; a file left at the Documents root by an early build is read and moved once).
+   Each item's id maps to its position as fractions of the safe area, plus an optional size
    in points and an optional opacity. Fractions survive rotating to the other landscape direction (the notch changes
    side) and map across devices; the defaults above stay the fallback, and saved values are clamped when read. The two
    editor handles stay fixed: a layout one could hide the way back into the editor. */
@@ -93,11 +97,19 @@ static const CGFloat kInkAlpha = .32;   // a button's opacity unless the player 
    Anything malformed is dropped, everything kept is clamped, so an edited-by-hand file cannot wedge the layer. */
 - (NSString *)layoutPath {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    return [docs stringByAppendingPathComponent:@"touch-layout.json"];
+    return [[docs stringByAppendingPathComponent:@"save"] stringByAppendingPathComponent:@"touch-layout.json"];
 }
 - (NSMutableDictionary *)readLayout {
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
-    NSData *raw = [NSData dataWithContentsOfFile:[self layoutPath]];
+    NSString *path = [self layoutPath]; NSData *raw = [NSData dataWithContentsOfFile:path];
+    if (!raw) {   // a layout left at the Documents root by an early build: read it and move it next to the saves
+        NSString *legacy = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject
+                            stringByAppendingPathComponent:@"touch-layout.json"] copy];
+        if ((raw = [NSData dataWithContentsOfFile:legacy])) {
+            [NSFileManager.defaultManager createDirectoryAtPath:[path stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+            if ([raw writeToFile:path atomically:YES]) [NSFileManager.defaultManager removeItemAtPath:legacy error:nil];
+        }
+    }
     NSDictionary *got = raw ? [NSJSONSerialization JSONObjectWithData:raw options:0 error:NULL] : nil;
     if (![got isKindOfClass:NSDictionary.class]) return out;
     for (NSString *item in got) {
@@ -232,13 +244,14 @@ static const CGFloat kSliderRowGap = 34;
     return id == kStickLeftID || id == kStickRightID ? self.stickRadius : kButtonSize;
 }
 - (CGFloat)sliderValue:(int)row {   // the selected item's size (row 0) or opacity (row 1), as 0..1 along the track
+    if (row == 2) return (totk_device_motion_sensitivity() * 100 - 10) / (200 - 10);   // the gyro's, in percent 10-200
     if (!selected) return 0;
     if (row == 0) return ([self sizeOf:selected] - 24) / (110 - 24);
     return ([self alphaFor:selected] - .1) / (1 - .1);
 }
-- (int)sliderAt:(CGPoint)p {   // which slider a touch is on (0 size, 1 opacity), or -1
-    if (!selected) return -1;
-    for (int row = 0; row < 2; row++) {
+- (int)sliderAt:(CGPoint)p {   // which slider a touch is on (0 size, 1 opacity, 2 gyro sensitivity), or -1
+    for (int row = 2; row >= 0; row--) {
+        if (row < 2 && !selected) continue;
         CGRect track = [self sliderTrack:row];
         if (fabs(p.y - track.origin.y) < 24 && p.x > track.origin.x - 16 && p.x < track.origin.x + track.size.width + 16) return row;
     }
@@ -246,6 +259,7 @@ static const CGFloat kSliderRowGap = 34;
 }
 - (void)setSlider:(int)row toFraction:(CGFloat)f {   // writes the selected item's size or opacity from a 0..1 slider value
     f = MIN(MAX(f, 0), 1);
+    if (row == 2) { totk_device_motion_set_sensitivity(10 + f * (200 - 10)); return; }
     if (!selected) return;
     NSMutableDictionary *d = [self seededItem:selected];
     if (row == 0) d[@"s"] = @(MIN(MAX(24 + f * (110 - 24), 24.), 110.));
@@ -285,6 +299,7 @@ static void stick_axes(CGPoint from, CGPoint to, CGFloat radius, int32_t *x, int
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     (void)event; concealed = NO; [hideTimer invalidate]; hideTimer = nil;
+    totk_device_motion_note_touch();   // touching the screen means playing with touch: the phone's gyro takes the aiming (device_motion.m)
     for (UITouch *t in touches) {
         CGPoint p = [t locationInView:self];
         if (hypot(p.x - [self handleAt:kEditID].x, p.y - [self handleAt:kEditID].y) < 30) {   // the gear opens and closes the editor
@@ -390,31 +405,36 @@ static void draw_stick(CGContextRef c, CGPoint o, CGPoint p, CGFloat r, CGFloat 
     for (NSString *item in drags.objectEnumerator) {
         CGPoint at = [self itemCenter:item];
         CGFloat rad = item.longLongValue == kStickLeftID || item.longLongValue == kStickRightID ? [self radiusFor:item] : 0;
-        if (!rad) { for (int i = 0; i < kButtonCount; i++) if (b[i].bit == item.longLongValue) rad = b[i].size * .75 + 8; }
+        if (!rad) { for (int i = 0; i < kButtonCount; i++) if (b[i].bit == (uint64_t)item.longLongValue) rad = b[i].size * .75 + 8; }
         if (rad) CGContextStrokeEllipseInRect(c, CGRectMake(at.x - rad, at.y - rad, 2 * rad, 2 * rad));
     }
     // The selected item's ring, and its two sliders (size, opacity) above the hint.
     if (selected) {
         CGPoint at = [self itemCenter:selected];
         CGFloat rad = selected.longLongValue == kStickLeftID || selected.longLongValue == kStickRightID ? [self radiusFor:selected] : 0;
-        if (!rad) for (int i = 0; i < kButtonCount; i++) if (b[i].bit == selected.longLongValue) rad = b[i].size * .75 + 8;
+        if (!rad) for (int i = 0; i < kButtonCount; i++) if (b[i].bit == (uint64_t)selected.longLongValue) rad = b[i].size * .75 + 8;
         CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:1 alpha:.9].CGColor);
         if (rad) CGContextStrokeEllipseInRect(c, CGRectMake(at.x - rad, at.y - rad, 2 * rad, 2 * rad));
-        NSArray<NSString *> *names = @[@"size", @"opacity"];
-        for (int row = 0; row < 2; row++) {
-            CGRect track = [self sliderTrack:row];
-            CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:1 alpha:.6].CGColor); CGContextSetLineWidth(c, 2);
-            CGContextMoveToPoint(c, track.origin.x, track.origin.y); CGContextAddLineToPoint(c, track.origin.x + track.size.width, track.origin.y); CGContextStrokePath(c);
-            CGFloat f = MIN(MAX([self sliderValue:row], 0), 1);
-            CGPoint knob = CGPointMake(track.origin.x + f * track.size.width, track.origin.y);
-            CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:1 alpha:.9].CGColor);
-            CGContextFillEllipseInRect(c, CGRectMake(knob.x - 11, knob.y - 11, 22, 22));
-            NSDictionary *lab = @{NSFontAttributeName: [UIFont systemFontOfSize:12], NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:.85]};
+    }
+    // The sliders: size and opacity for the selected item (rows 0, 1), and the gyro's sensitivity (row 2) always.
+    for (int row = 0; row < 3; row++) {
+        if (row < 2 && !selected) continue;
+        CGRect track = [self sliderTrack:row];
+        CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:1 alpha:.6].CGColor); CGContextSetLineWidth(c, 2);
+        CGContextMoveToPoint(c, track.origin.x, track.origin.y); CGContextAddLineToPoint(c, track.origin.x + track.size.width, track.origin.y); CGContextStrokePath(c);
+        CGFloat f = MIN(MAX([self sliderValue:row], 0), 1);
+        CGPoint knob = CGPointMake(track.origin.x + f * track.size.width, track.origin.y);
+        CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:1 alpha:.9].CGColor);
+        CGContextFillEllipseInRect(c, CGRectMake(knob.x - 11, knob.y - 11, 22, 22));
+        NSDictionary *lab = @{NSFontAttributeName: [UIFont systemFontOfSize:12], NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:.85]};
+        NSString *label;
+        if (row == 2) label = [NSString stringWithFormat:@"gyro sensitivity · %.0f%%", totk_device_motion_sensitivity() * 100];
+        else {
             NSString *value = row == 0 ? [NSString stringWithFormat:@"size %.0f pt", [self sizeOf:selected]]
                                        : [NSString stringWithFormat:@"opacity %.0f%%", [self alphaFor:selected] * 100];
-            NSString *label = [NSString stringWithFormat:@"%@ · %@", names[row], value];
-            [label drawAtPoint:CGPointMake(track.origin.x, track.origin.y - 22) withAttributes:lab];
+            label = [NSString stringWithFormat:@"%@ · %@", row == 0 ? @"size" : @"opacity", value];
         }
+        [label drawAtPoint:CGPointMake(track.origin.x, track.origin.y - 22) withAttributes:lab];
     }
     NSString *hint = @"drag = move · tap = select · slider = size & opacity · hold = reset";
     NSDictionary *tiny = @{NSFontAttributeName: [UIFont systemFontOfSize:13], NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:.85]};
